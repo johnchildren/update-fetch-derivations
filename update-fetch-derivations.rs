@@ -61,6 +61,22 @@ use std::io::prelude::*;
 use std::iter::FromIterator;
 use std::process::Command;
 
+macro_rules! compose_linear {
+    ($($func:ident,)*) => {
+        |val| {
+            $(
+            let val = $func(val);
+            )*
+            return val
+        }
+    }
+}
+
+struct Replacement {
+    contents: String,
+    count: usize,
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let target_file_path = args.get(1).expect(EXPECT_FILE_PATH_ARG_MSG);
@@ -73,21 +89,25 @@ fn main() {
         .read_to_string(&mut contents)
         .expect("Could not extract contents of specified in_file.");
     drop(in_file);
-    let mut count: usize = 0;
 
-    update_fetch_from_github(&mut contents, &mut count);
-    update_fetch_git(&mut contents, &mut count);
-    update_fetch_url(&mut contents, &mut count);
+    let replacement = compose_linear! {
+        update_fetch_from_github,
+        update_fetch_git,
+        update_fetch_url,
+    }(Replacement { contents, count: 0 });
 
     let mut out_file = File::create(target_file_path)
         .unwrap_or_else(|_| panic!("invalid out_file path provided: {}", target_file_path));
     out_file
-        .write_fmt(format_args!("{}", contents))
+        .write_fmt(format_args!("{}", replacement.contents))
         .unwrap_or_else(|_| panic!("Unable to write to out_file {}", target_file_path));
-    println!("updated {} derivations in {}", count, target_file_path);
+    println!(
+        "updated {} derivations in {}",
+        replacement.count, target_file_path
+    );
 }
 
-fn update_fetch_from_github(contents: &mut String, count: &mut usize) {
+fn update_fetch_from_github(replacement: Replacement) -> Replacement {
     let github_regex = RegexBuilder::new(r"(fetchFromGitHub \{)(.*?)(\})")
         .dot_matches_new_line(true)
         .build()
@@ -98,7 +118,7 @@ fn update_fetch_from_github(contents: &mut String, count: &mut usize) {
     let rev_regex: Regex = Regex::new(r#"(rev = ")(.*?)(";)"#).unwrap();
     let sha256_regex: Regex = Regex::new(r#"(sha256 = ")(.*?)(";)"#).unwrap();
 
-    update_contents_by_inner(contents, count, github_regex, |inner: &mut String| {
+    update_contents_by_inner(replacement, github_regex, |inner: &mut String| {
         let owner = &owner_regex.captures(inner).unwrap()[1];
         let repo = &repo_regex.captures(inner).unwrap()[1];
         println!("Fetching: {}/{}", owner, repo);
@@ -127,10 +147,10 @@ fn update_fetch_from_github(contents: &mut String, count: &mut usize) {
             })
             .to_owned()
             .to_string();
-    });
+    })
 }
 
-fn update_fetch_git(contents: &mut String, count: &mut usize) {
+fn update_fetch_git(replacement: Replacement) -> Replacement {
     let fetchgit_regex = RegexBuilder::new(r"(fetchgit \{)(.*?)(\})")
         .dot_matches_new_line(true)
         .build()
@@ -143,7 +163,7 @@ fn update_fetch_git(contents: &mut String, count: &mut usize) {
     let rev_json_regex: Regex = Regex::new(r#"("rev": ")(.*?)(",)"#).unwrap();
     let sha256_json_regex: Regex = Regex::new(r#"("sha256": ")(.*?)(",)"#).unwrap();
 
-    update_contents_by_inner(contents, count, fetchgit_regex, |inner: &mut String| {
+    update_contents_by_inner(replacement, fetchgit_regex, |inner: &mut String| {
         let url = &url_regex.captures(&inner).unwrap()[1];
         println!("Fetching: {}", url);
 
@@ -185,10 +205,10 @@ fn update_fetch_git(contents: &mut String, count: &mut usize) {
                 String::from_utf8(prefetch_attempt.stderr)
             );
         }
-    });
+    })
 }
 
-fn update_fetch_url(contents: &mut String, count: &mut usize) {
+fn update_fetch_url(replacement: Replacement) -> Replacement {
     let fetchurl_regex = RegexBuilder::new(r"(fetchurl \{)(.*?)(\})")
         .dot_matches_new_line(true)
         .build()
@@ -197,7 +217,7 @@ fn update_fetch_url(contents: &mut String, count: &mut usize) {
     let url_regex: Regex = Regex::new(r#"url = "(.*?)";"#).unwrap();
     let sha256_regex: Regex = Regex::new(r#"(sha256 = ")(.*?)(";)"#).unwrap();
 
-    update_contents_by_inner(contents, count, fetchurl_regex, |inner: &mut String| {
+    update_contents_by_inner(replacement, fetchurl_regex, |inner: &mut String| {
         if let Some(matches) = url_regex.captures(&inner) {
             let url = &matches[1];
             println!("Fetching: {}", url);
@@ -224,18 +244,18 @@ fn update_fetch_url(contents: &mut String, count: &mut usize) {
                 );
             }
         };
-    });
+    })
 }
 
 // update contents of a file, mutating the contents and adding to the count of matches.
 // the match regex argument used to break the literal matches and the actual captured groups to be processed.
 // the contents of each capture are called "inner", which is used by the update_inner closure argument.
 fn update_contents_by_inner<F>(
-    contents: &mut String,
-    count: &mut usize,
+    replacement: Replacement,
     match_regex: Regex,
     update_inner: F,
-) where
+) -> Replacement
+where
     F: Fn(&mut String),
 {
     let mut acc: String = String::new();
@@ -244,8 +264,8 @@ fn update_contents_by_inner<F>(
     // how this works:
     // put together all the literal and captured segments, in ABABA pattern.
     // the inner matched section of a capture segment should be updated
-    let lits = Vec::from_iter(match_regex.split(&contents));
-    let caps = match_regex.captures_iter(&contents);
+    let lits = Vec::from_iter(match_regex.split(&replacement.contents));
+    let caps = match_regex.captures_iter(&replacement.contents);
 
     for (i, cap) in caps.enumerate() {
         let mut inner = String::from(&cap[2]);
@@ -261,8 +281,10 @@ fn update_contents_by_inner<F>(
         acc.push_str(s);
     };
 
-    *count += lits.len() - 1;
-    *contents = acc;
+    Replacement {
+        count: replacement.count + lits.len() - 1,
+        contents: acc,
+    }
 }
 
 const INVALID_PREFETCH_GIT_SHA: &str = "0sjjj9z1dhilhpc8pq4154czrb79z9cm044jvn75kxcjv6v5l2m5";
